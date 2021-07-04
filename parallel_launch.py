@@ -61,7 +61,9 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_integer("num_instances", None, "Number of instances to launch.")
 flags.DEFINE_string("name", None, "Instance name prefix.")
-flags.DEFINE_string("log_dir", None, "GCS bucket to copy logs out to.")
+#�����G����define flag "log_dir"
+#���ѱ��i�ȮɸѨM
+#flags.DEFINE_string("log_dir", None, "GCS bucket to copy logs out to.")
 flags.DEFINE_string("code_dir", None, "Directory to copy.")
 flags.DEFINE_string("setup_command", None, "Setup command to run.")
 flags.DEFINE_string("command_prefix", None, "Command to run, prefix.")
@@ -86,8 +88,10 @@ DELETE_SELF = ("gcloud compute instances delete $(hostname) --quiet "
 CREATE_INSTANCE = ("gcloud compute instances create {instance_name} "
                    "--custom-cpu {cpu} --custom-memory {mem} "
                    "--custom-extensions "
-                   "--image-project=ml-images --image-family=tf-1-7 "
-                   "--scopes=cloud-platform")
+                   #"--image-project=ml-images --image-family=tf-1-7 "
+                   "--image-project=deeplearning-platform-release --image-family=tf2-ent-latest-cpu"
+                   #"--scopes=cloud-platform"
+                   )
 COPY_CODE = "gcloud compute scp --recurse {local_dir} {instance_name}:~/"
 SSH = "gcloud compute ssh {instance_name} --command"
 SCREEN = "screen -dmS test bash -c \"{command}\""
@@ -187,6 +191,9 @@ def launch_instance(instance_name,
   if code_dir:
     shell_run_with_retry(COPY_CODE, retries=2,
                          local_dir=code_dir, instance_name=instance_name)
+
+  #��requirement.txt�L�h
+  #print(cloud.shell_output("gcloud compute scp requ.txt {instance_name}:~", instance_name=instance_name))
 
   # Run setup
   if setup_command:
