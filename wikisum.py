@@ -41,9 +41,15 @@ from tensor2tensor.utils import registry
 import tensorflow.compat.v1 as tf
 from urllib.parse import quote
 
+import torch
+from torch.utils.data import Dataset as Torch_dataset
+from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from torch.nn import functional as F
+
 #XLM
 import sys
-sys.path.append("/home/zchen/XWikiSum/src/data/")
+sys.path.append("/home/zchen/XLM/src/data/")
 from dictionary import Dictionary
 
 PROCESS_FOLDER_PREFIX = "process"
@@ -57,7 +63,7 @@ WIKI_URLS_DIR = os.path.join(BASE_SUPPORT_DIR, "wiki_urls")
 WET_METADATA_DIR = os.path.join(BASE_SUPPORT_DIR, "commoncrawl_metadata")
 WIKI_CONTENT_FILE = "wiki_content.tfrecords-%05d-of-01000"
 WIKI_URLS_FILE = "wiki_urls.json-%05d-of-01000"
-LINKED_ARTICLES_FILE="gs://iisr-wikisum-bucket2/linked_articles/linked_articles-{:0>5d}-of-01000.json"
+LINKED_ARTICLES_FILE="iisr-wikisum-bucket2/linked_articles/linked_articles-{:0>5d}-of-01000.json"
 
 EOT = "<EOT>"  # end-of-title string
 _MIN_REFS = 1
@@ -336,7 +342,7 @@ def generate_wiki_data(shard_id, wikis_dir, from_WikiAPI=False):
   with tf.gfile.Open(file) as f:
       linked_articles = json.load(f)
       
-  file=f"/home/zchen/XWikiSum/wikisum/en2zh_dataset/zh_articles/zh_articles-{shard_id:>05}-of-01000.json"
+  file=f"/home/zchen/XLM/wikisum/en2zh_dataset/zh_articles/zh_articles-{shard_id:>05}-of-01000.json"
   with tf.gfile.Open(file) as f:
       zh_articles = json.load(f)
 
@@ -404,70 +410,164 @@ def _normalize_text(text):
 def _tokens_to_score(tokens):
   return {t for t in tokens if re.search("[a-z0-9]", t)}
 
+class Ranking_Dataset(Torch_dataset):
 
-def rank_reference_paragraphs(wiki_article, references_content, normalize=True):
-  """Rank and return reference paragraphs by tf-idf score on article tokens."""
-  # 統計references的token
-  ref_paragraph_info = []
-  doc_counts = collections.defaultdict(int)
-  for ref in references_content:
-    for paragraph in ref.split("\n"):
-      normalized_paragraph = _normalize_text(paragraph)
-      if cc_utils.filter_paragraph(normalized_paragraph):
-        # Skip paragraph
-        continue
+    def __init__(self, zh_intro, ref, maxlen, dico):
+        zh_intro = np.concatenate(zh_intro)
 
-      paragraph_tokens = _tokens_to_score(set(tokenizer.encode(text_encoder.native_to_unicode(normalized_paragraph))))
-      counts = _token_counts(normalized_paragraph, paragraph_tokens)
-      for token in paragraph_tokens:
-        if counts[token]:
-          doc_counts[token] += 1
+        self.inputs = ref + [zh_intro]
+        self.maxlen=maxlen
+        self.dico=dico
+        
+    def __getitem__(self, index):
+        eos_index=self.dico.eos_index
+        paragraph = [eos_index] + self.inputs[index].astype(np.int64).tolist() + [eos_index]
+        paragraph = paragraph[:self.maxlen]
+        langs = index == len(self.inputs) - 1
 
-      content = normalized_paragraph if normalize else paragraph
-      info = {"content": content, "counts": counts}
-      ref_paragraph_info.append(info)
-      
-  # 統計article的token
-  normalized_article = _normalize_text(wiki_article)
-  article_tokens = _tokens_to_score(
-      set(tokenizer.encode(text_encoder.native_to_unicode(normalized_article))))
-  article_counts = _token_counts(normalized_article, article_tokens)
-  for token in article_tokens:
-    if article_counts[token]:
-      doc_counts[token] += 1
-      
-  # 計算article的TFIDF向量
-  article_vec = []
-  n_doc = len(ref_paragraph_info) + 1
-  for token in doc_counts:
-    if token in article_counts:
-      term_frequency = article_counts[token]
-      inv_doc_frequency = float(n_doc) / max(doc_counts[token], 1)
-      article_vec.append(term_frequency * math.log(inv_doc_frequency))
-    else:
-      article_vec.append(0)
+        return paragraph, len(paragraph), langs
+
+    def __len__(self):
+        return len(self.inputs)
+
+def collate(samples, padding_value):
+    inputs = [s[0] for s in samples]
+    inputs=[torch.LongTensor(t) for t in inputs]
+    inputs = pad_sequence(inputs, padding_value=padding_value)    # (slen, bs)
     
-  article_vec = np.array(article_vec)
+    ilen = [s[1] for s in samples]
+    ilen = torch.LongTensor(ilen)
+    langs = [s[2] for s in samples]
+    langs = torch.LongTensor(langs).unsqueeze(0).expand_as(inputs)
+    
+    return inputs, ilen, langs
+
+def rank_reference_paragraphs(text_ranked_by, references_content, normalize=True, paragraph_ranking_method="TFIDF-title", LM=None, params=None, dictionary=None):
   
-  # 計算references的TFIDF向量
-  # 計算references和article的相似度
-  for info in ref_paragraph_info:
-    vec = []
-    for token in doc_counts:
-      if token in info["counts"]:
+  if paragraph_ranking_method == "TFIDF-title":
+    """ Rank and return reference paragraphs by tf-idf score on title tokens. """
+    normalized_title = _normalize_text(text_ranked_by)
+    title_tokens = _tokens_to_score(
+        set(tokenizer.encode(text_encoder.native_to_unicode(normalized_title))))
+    ref_paragraph_info = []
+    doc_counts = collections.defaultdict(int)
+    for ref in references_content:
+      for paragraph in ref.split("\n"):
+        normalized_paragraph = _normalize_text(paragraph)
+        if cc_utils.filter_paragraph(normalized_paragraph):
+          # Skip paragraph
+          continue
+        counts = _token_counts(normalized_paragraph, title_tokens)
+        for token in title_tokens:
+          if counts[token]:
+            doc_counts[token] += 1
+        content = normalized_paragraph if normalize else paragraph
+        info = {"content": content, "counts": counts}
+        ref_paragraph_info.append(info)
+
+    for info in ref_paragraph_info:
+      score = 0.
+      for token in title_tokens:
         term_frequency = info["counts"][token]
-        inv_doc_frequency = float(n_doc) / max(doc_counts[token], 1)
-        vec.append(term_frequency * math.log(inv_doc_frequency))
-      else:
-        vec.append(0)
-    
-    vec = np.array(vec)
-    cos = np.dot(article_vec, vec) / (la.norm(article_vec) * la.norm(vec))  # 餘弦相似
-    info["score"] = cos
-  
-  ref_paragraph_info.sort(key=lambda el: el["score"], reverse=True)
-  return [info["content"] for info in ref_paragraph_info]
+        inv_doc_frequency = (
+            float(len(ref_paragraph_info)) / max(doc_counts[token], 1))
+        score += term_frequency * math.log(inv_doc_frequency)
+      info["score"] = score
 
+    ref_paragraph_info.sort(key=lambda el: el["score"], reverse=True)
+    return [info["content"] for info in ref_paragraph_info]
+  elif paragraph_ranking_method == "TFIDF-paragraph":
+    """ Rank and return reference paragraphs by tf-idf score on article tokens. """
+    # 統計references的token
+    ref_paragraph_info = []
+    doc_counts = collections.defaultdict(int)
+    for ref in references_content:
+      for paragraph in ref.split("\n"):
+        normalized_paragraph = _normalize_text(paragraph)
+        if cc_utils.filter_paragraph(normalized_paragraph):
+          # Skip paragraph
+          continue
+
+        paragraph_tokens = _tokens_to_score(set(tokenizer.encode(text_encoder.native_to_unicode(normalized_paragraph))))
+        counts = _token_counts(normalized_paragraph, paragraph_tokens)
+        for token in paragraph_tokens:
+          if counts[token]:
+            doc_counts[token] += 1
+
+        content = normalized_paragraph if normalize else paragraph
+        info = {"content": content, "counts": counts}
+        ref_paragraph_info.append(info)
+        
+    # 統計article的token
+    normalized_article = _normalize_text(text_ranked_by)
+    article_tokens = _tokens_to_score(
+        set(tokenizer.encode(text_encoder.native_to_unicode(normalized_article))))
+    article_counts = _token_counts(normalized_article, article_tokens)
+    for token in article_tokens:
+      if article_counts[token]:
+        doc_counts[token] += 1
+        
+    # 計算article的TFIDF向量
+    article_vec = []
+    n_doc = len(ref_paragraph_info) + 1
+    for token in doc_counts:
+      if token in article_counts:
+        term_frequency = article_counts[token]
+        inv_doc_frequency = float(n_doc) / max(doc_counts[token], 1)
+        article_vec.append(term_frequency * math.log(inv_doc_frequency))
+      else:
+        article_vec.append(0)
+      
+    article_vec = np.array(article_vec)
+    
+    # 計算references的TFIDF向量
+    # 計算references和article的相似度
+    for info in ref_paragraph_info:
+      vec = []
+      for token in doc_counts:
+        if token in info["counts"]:
+          term_frequency = info["counts"][token]
+          inv_doc_frequency = float(n_doc) / max(doc_counts[token], 1)
+          vec.append(term_frequency * math.log(inv_doc_frequency))
+        else:
+          vec.append(0)
+      
+      vec = np.array(vec)
+      cos = np.dot(article_vec, vec) / (la.norm(article_vec) * la.norm(vec))  # 餘弦相似
+      info["score"] = cos
+    
+    ref_paragraph_info.sort(key=lambda el: el["score"], reverse=True)
+    return [info["content"] for info in ref_paragraph_info]
+  else:
+    """
+    Rank and return reference paragraphs by tf-idf score on article tokens.
+    text_ranked_by: [np.array(int32)]
+    references_content: [np.array(int32)]
+    """
+    dataset = Ranking_Dataset(text_ranked_by, references_content, maxlen=params.bptt, dico=dictionary)
+    dataloader=DataLoader(
+        dataset,
+        batch_size=params.batch_size,
+        shuffle=False,
+        collate_fn=lambda samples: collate(samples, params.pad_index))
+        
+    sent_embs = []
+    for batch in dataloader:
+      inputs, ilen, langs = [t.cuda() for t in batch]
+      output = LM('fwd', x=inputs, lengths=ilen, langs=langs, causal=False)    # (slen, bs, dim)
+      mean = output.sum(dim=0) / ilen.unsqueeze(-1)    # (bs, dim)
+      sent_embs.append(mean)
+
+    # Compute the cosine similarities.
+    sent_embs = torch.cat(sent_embs, dim=0)
+    zh_intro_emb = sent_embs[-1:]    # (1, dim)
+    ref_embs = sent_embs[:-1]    # (#ref, dim)
+    cos_sims = F.cosine_similarity(ref_embs, zh_intro_emb).tolist()
+    assert len(references_content) == len(cos_sims)
+
+    ref_paragraph_info = list(zip(references_content, cos_sims))
+    ref_paragraph_info.sort(key=lambda el: el[1], reverse=True)
+    return [info[0] for info in ref_paragraph_info]
 
 def produce_examples(shard_ids, wikis_dir, refs_dir, urls_dir, vocab_path,
                      out_filepaths):
@@ -570,19 +670,18 @@ def produce_examples(shard_ids, wikis_dir, refs_dir, urls_dir, vocab_path,
 
   generator_utils.generate_files(example_generator(), out_filepaths)
 
-def produce_dataset(shard_ids, wikis_dir, refs_dir, urls_dir, out_dir, from_WikiAPI, PID):
+def produce_dataset(shard_ids, wikis_dir, refs_dir, urls_dir, out_dir, from_WikiAPI, paragraph_ranking_method, PID=0, LM=None, params=None):
   # * Join the Wikipedia articles with their references
   # * Run Tf-idf to sort reference paragraphs
   # * Encode the Wikipedia and reference text with the vocabulary
   # * Write out TFRecords of tensorflow.Example
   start_time=time.time()
   tf.logging.info("Process %d: Processing %d input shards.", PID, len(shard_ids))
-  voc_path="/home/zchen/XLM/data/processed/XLM_en_zh/50k/vocab"
-  dictionary = Dictionary.read_vocab(voc_path)
+  vocab_path="/home/zchen/XLM/data/processed/XLM_en_zh/50k_server153/vocab"
+  dictionary = Dictionary.read_vocab(vocab_path)
 
   #本可用傳參的方式傳入bpe，但由於要執行multiprocessing，無法用pickle序列化，所以定義於此。
-  codes_path="/home/zchen/XLM/data/processed/XLM_en_zh/50k/codes"
-  vocab_path="/home/zchen/XLM/data/processed/XLM_en_zh/50k/vocab"
+  codes_path="/home/zchen/XLM/data/processed/XLM_en_zh/50k_server153/codes"
   bpe = fastBPE.fastBPE(codes_path, vocab_path)
 
   stats = dict(start=shard_ids[0],
@@ -594,13 +693,13 @@ def produce_dataset(shard_ids, wikis_dir, refs_dir, urls_dir, out_dir, from_Wiki
   ref_files_by_shard = _references_files_by_shard(refs_dir)
 
   # 載入非訓練資料
-  file_path = "/home/zchen/XWikiSum/wikisum/en2zh_dataset/non_training_articles.json"
+  file_path = "/home/zchen/XLM/wikisum/en2zh_dataset/non_training_articles.json"
   with open(file_path, 'r', encoding='utf-8') as f:
       non_training_titles = set(json.load(f))
 
   def tokenize(text, lg):
     command=f'tools/tokenize.sh {lg} 2>&-'
-    CompletedProcess=subprocess.run(command, input=text, cwd="/home/zchen/XWikiSum/", encoding="utf-8", shell=True, stdout=subprocess.PIPE)
+    CompletedProcess=subprocess.run(command, input=text, cwd="/home/zchen/XLM/", encoding="utf-8", shell=True, stdout=subprocess.PIPE)
 
     return CompletedProcess.stdout[:-1]  # tokenize.sh會多加一個'\n'在最後
 
@@ -658,7 +757,7 @@ def produce_dataset(shard_ids, wikis_dir, refs_dir, urls_dir, out_dir, from_Wiki
       inputs["paragraphs"]=Dictionary.index_sentences(paragraphs, dictionary)
         # dict:
         #     {
-        #       'sentences': np.array(int32),
+        #       'sentences': [np.array(int32)],
         #       'unk_words': dict,
         #     }
 
@@ -708,12 +807,15 @@ def produce_dataset(shard_ids, wikis_dir, refs_dir, urls_dir, out_dir, from_Wiki
       }
     for i, (en_wiki, zh_title, zh_intro) in enumerate(generate_wiki_data(shard_id, wikis_dir)):
       print(PID)
-      en_intro = en_wiki.sections[0].text
-      
-      # Skip if intro is too short
-      if (len(en_intro) < _MIN_LEADSECTION_TOKENS):
-        stats["wikis_skipped_short_en_intro"] += 1
-        continue
+
+      if paragraph_ranking_method == "TFIDF-paragraph":
+        en_intro = en_wiki.sections[0].text
+        
+        # Skip if intro is too short
+        if (len(en_intro) < _MIN_LEADSECTION_TOKENS):
+          stats["wikis_skipped_short_en_intro"] += 1
+          continue
+
       if (len(zh_intro) < _MIN_LEADSECTION_TOKENS):
         stats["wikis_skipped_short_zh_intro"] += 1
         continue
@@ -742,23 +844,35 @@ def produce_dataset(shard_ids, wikis_dir, refs_dir, urls_dir, out_dir, from_Wiki
         stats["wikis_skipped_no_refs"] += 1
         continue
 
-      # Rank reference paragraphs with TFIDF
-      en_intro = _normalize_text(en_intro)
-      ranked_paragraphs = rank_reference_paragraphs(en_intro,
-                                                    wiki_ref_content)
-      if not ranked_paragraphs: continue  # rank_reference_paragraphs()中會做篩選
-
       wiki_title = _normalize_text(en_wiki.title)
-      
-      paragraphs=[]
-      n_tokens=0
-      for paragraph in ranked_paragraphs:
-        n_tokens+=len(paragraph)
-        if n_tokens >= 256**2:
-          break
-        paragraphs.append(paragraph)
 
-      if not paragraphs: continue  # 若第一段太長，直接捨棄。
+      if paragraph_ranking_method != "LM":
+        """ Rank reference """
+        if paragraph_ranking_method == "TFIDF-title":
+          text_ranked_by = wiki_title
+        elif paragraph_ranking_method == "TFIDF-paragraph":
+          text_ranked_by = _normalize_text(en_intro)
+        ranked_paragraphs = rank_reference_paragraphs(text_ranked_by, wiki_ref_content, paragraph_ranking_method)
+        if not ranked_paragraphs: continue  # rank_reference_paragraphs()中會做篩選
+        
+        paragraphs=[]
+        n_tokens=0
+        for paragraph in ranked_paragraphs:
+          n_tokens+=len(paragraph)
+          if n_tokens >= 256**2:
+            break
+          paragraphs.append(paragraph)
+
+        if not paragraphs: continue  # 若第一段太長，直接捨棄。
+      else:
+        paragraphs=[]
+        for ref in wiki_ref_content:
+          for paragraph in ref.split("\n"):
+            normalized_paragraph = _normalize_text(paragraph)
+            if cc_utils.filter_paragraph(normalized_paragraph):
+              # Skip paragraph
+              continue
+            paragraphs.append(normalized_paragraph)
       paragraphs='\n'.join(paragraphs)
       
       # 儲存中文條目
@@ -799,6 +913,32 @@ def produce_dataset(shard_ids, wikis_dir, refs_dir, urls_dir, out_dir, from_Wiki
       if data == None:
         del zh_articles[zh_titles[i]]
         continue
+
+      if paragraph_ranking_method == "LM":
+        """ Rank reference """
+        ranked_paragraphs = rank_reference_paragraphs(
+          text_ranked_by=data["targets"]["intro"]["sentences"],
+          references_content=data["inputs"]["paragraphs"]["sentences"],
+          paragraph_ranking_method=paragraph_ranking_method,
+          LM=LM, params=params, dictionary=dictionary)
+        if not ranked_paragraphs:
+          del zh_articles[zh_titles[i]]
+          continue  # rank_reference_paragraphs()中會做篩選
+        
+        paragraphs=[]
+        n_tokens=0
+        for paragraph in ranked_paragraphs:
+          n_tokens+=len(paragraph)
+          if n_tokens >= 256**2:
+            break
+          paragraphs.append(paragraph)
+
+        if not paragraphs:
+          del zh_articles[zh_titles[i]]
+          continue  # 若第一段太長，直接捨棄。
+
+        data["inputs"]["paragraphs"]["sentences"] = paragraphs
+
       pkl_data=pickle.dumps(data)
       dataset.append(pkl_data)
 
@@ -818,7 +958,7 @@ def produce_dataset(shard_ids, wikis_dir, refs_dir, urls_dir, out_dir, from_Wiki
         f.write(f"shard {shard_id}: {len(dataset)} {len(zh_articles)}\n\n")
 
     if from_WikiAPI:
-      file = "/home/zchen/XWikiSum/wikisum/en2zh_dataset/zh_articles/zh_articles-{shard_id:0>5d}-of-01000.json"
+      file = "/home/zchen/XLM/wikisum/en2zh_dataset/zh_articles/zh_articles-{shard_id:0>5d}-of-01000.json"
       with tf.gfile.Open(file, "w") as f:
         json.dump(zh_articles, f, ensure_ascii=False)
 
@@ -849,11 +989,11 @@ def produce_dataset(shard_ids, wikis_dir, refs_dir, urls_dir, out_dir, from_Wiki
                   
 # debug用
 def preprocess(text, lg, bpe):
-  voc_path="/home/zchen/XLM/data/processed/XLM_en_zh/50k/vocab"
+  voc_path="/home/zchen/XLM/data/processed/XLM_en_zh/50k_server153/vocab"
   dictionary = Dictionary.read_vocab(voc_path)
 
   command=f'tools/tokenize.sh {lg} 2>&-'
-  t=subprocess.run(command, input=text, cwd="/home/zchen/XWikiSum/", encoding="utf-8", shell=True, stdout=subprocess.PIPE).stdout[:-1]  # tokenize.sh會多加一個'\n'在最後
+  t=subprocess.run(command, input=text, cwd="/home/zchen/XLM/", encoding="utf-8", shell=True, stdout=subprocess.PIPE).stdout[:-1]  # tokenize.sh會多加一個'\n'在最後
   print(t)
 
   postBPE_data=bpe.apply(t.split('\n'))
